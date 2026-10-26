@@ -1,8 +1,8 @@
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import {
 	createReadTool,
+	getAgentDir,
 	type AgentToolResult,
 	type ExtensionAPI,
 	type ExtensionContext,
@@ -88,7 +88,7 @@ function parseJwtAccountId(token: string): string | undefined {
 }
 
 async function readCodexAuth(): Promise<{ token: string; accountId: string }> {
-	const authPath = join(homedir(), ".pi", "agent", "auth.json");
+	const authPath = join(getAgentDir(), "auth.json");
 	const raw = await readFile(authPath, "utf8");
 	const auth = JSON.parse(raw)?.["openai-codex"] as CodexAuth | undefined;
 	const token = auth?.access;
@@ -126,7 +126,9 @@ function parseSseEvents(text: string): unknown[] {
 function findGeneratedImage(events: unknown[]): string | undefined {
 	for (const event of events) {
 		if (!event || typeof event !== "object") continue;
-		const item = (event as { item?: unknown }).item;
+		const typedEvent = event as { type?: unknown; item?: unknown };
+		if (typedEvent.type !== "response.output_item.done") continue;
+		const item = typedEvent.item;
 		if (!item || typeof item !== "object") continue;
 		const typedItem = item as { type?: unknown; result?: unknown };
 		if (typedItem.type === "image_generation_call" && typeof typedItem.result === "string" && typedItem.result.length > 0) {
@@ -175,13 +177,41 @@ async function generateCodexImage(prompt: string, modelId: string, signal?: Abor
 	return imageBase64;
 }
 
+function decodePng(imageBase64: string): Buffer {
+	const data = Buffer.from(imageBase64, "base64");
+	const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+	if (data.length < signature.length || !data.subarray(0, signature.length).equals(signature)) {
+		throw new Error("Codex image generation returned invalid PNG data");
+	}
+	let offset = signature.length;
+	let hasIhdr = false;
+	let hasIend = false;
+	while (offset + 12 <= data.length) {
+		const length = data.readUInt32BE(offset);
+		const chunkEnd = offset + 12 + length;
+		if (chunkEnd > data.length) throw new Error("Codex image generation returned truncated PNG data");
+		const type = data.toString("ascii", offset + 4, offset + 8);
+		if (type === "IHDR") {
+			if (hasIhdr || length !== 13 || offset !== signature.length) throw new Error("Codex image generation returned invalid PNG data");
+			hasIhdr = true;
+		}
+		if (type === "IEND") {
+			hasIend = length === 0 && chunkEnd === data.length;
+			break;
+		}
+		offset = chunkEnd;
+	}
+	if (!hasIhdr || !hasIend) throw new Error("Codex image generation returned incomplete PNG data");
+	return data;
+}
+
 async function saveGeneratedImage(cwd: string, imageBase64: string): Promise<{ path: string; latestPath: string }> {
 	const outputDir = resolve(cwd, ".pi", "openai-codex-images");
 	await mkdir(outputDir, { recursive: true });
 	const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
 	const imagePath = join(outputDir, `${timestamp}.png`);
 	const latestPath = join(outputDir, "latest.png");
-	const data = Buffer.from(imageBase64, "base64");
+	const data = decodePng(imageBase64);
 	await writeFile(imagePath, data);
 	await writeFile(latestPath, data);
 	return { path: imagePath, latestPath };
